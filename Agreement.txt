@@ -1,0 +1,18 @@
+VIDEO COMPRESSOR - USER AGREEMENT
+
+Please read this before installing.
+
+ABOUT THIS SOFTWARE
+Video Compressor is a small hobby project. It was vibe-coded (written with the help of AI) as a PowerShell script that provides a simple window for compressing a video to a target file size. The actual video processing is done by FFmpeg (ffmpeg.exe and ffprobe.exe), a separate open-source program that is bundled with this installer.
+
+USE AT YOUR OWN RISK
+This software is provided "AS IS", without warranty of any kind, express or implied. The author is not responsible for any loss of data, damaged or corrupted video files, wasted time, or any other problem that may result from installing or using it. Always keep a copy of your original video. The tool is designed to write a new file and leave your original untouched, but you are responsible for your own files.
+
+IF IN DOUBT, CHECK THE CODE
+You do not have to take anyone's word for what this software does. The whole program is a single readable text script (VideoCompressor.ps1) that you can open in Notepad after installation, in the install folder. The script is also published on GitHub by Whitepumpkin: https://github.com/Whitepumpkin24/video-compressor
+If you are unsure or uncomfortable, review the script first, or do not install it.
+
+THIRD-PARTY SOFTWARE
+FFmpeg is licensed under the GNU General Public License (GPL). A copy of the license is included in the install folder (LICENSE file). More information: https://ffmpeg.org
+
+By clicking "I accept the agreement" you confirm that you have read this notice and agree to use the software at your own risk.
