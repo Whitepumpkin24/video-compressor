@@ -1,7 +1,8 @@
 #Requires -Version 5.1
 <#
-  Video Compressor GUI v1.1
+  Video Compressor GUI v1.2.2
   Compress a video to a target file size (MB) using ffmpeg.
+   - Output format: MP4, MKV, MOV (H.264 + AAC) or WebM (VP9 + Opus).
    - Auto-detects a GPU H.264 encoder (NVIDIA NVENC / Intel QSV / AMD AMF), falls back to CPU (x264).
    - CPU = 2-pass encode (accurate size). GPU = 1-pass capped VBR (fast, lands slightly under target).
   Needs ffmpeg.exe + ffprobe.exe in the same folder as this script (or in PATH).
@@ -15,29 +16,40 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 # 1. CONFIG
 # =====================================================================
 $script:AppName = 'Video Compressor'
-$script:AppVer  = '1.1'
+$script:AppVer  = '1.2.2'
 $script:Cfg = @{
-    DefaultMB      = 20
+    MaxMB          = 10000  # largest accepted target size
     MarginCpu      = 0.95   # 2-pass x264 is accurate -> 5% safety margin
     MarginGpu      = 0.92   # 1-pass GPU VBR is looser -> 8% safety margin
     MinVideoKbps   = 50     # below this the target is refused
     LowQualityKbps = 300    # below this the user is warned
-    TimerMs        = 500
+    TimerMs        = 500    # progress polling interval
 }
 $script:AppData = Join-Path $env:LOCALAPPDATA 'VideoCompressor'
 $script:ErrLog  = Join-Path $script:AppData 'error.log'
 
 # Encoder table. Opts are the same options used for the real encode AND for the detection test.
 $script:Encoders = @(
-    @{ Id = 'h264_nvenc'; Name = 'NVIDIA NVENC (GPU)';     Opts = '-preset p5 -tune hq -rc vbr' },
-    @{ Id = 'h264_qsv';   Name = 'Intel Quick Sync (GPU)'; Opts = '-preset slow' },
-    @{ Id = 'h264_amf';   Name = 'AMD AMF (GPU)';          Opts = '-quality quality -rc vbr_peak' }
+    @{ Id = 'h264_nvenc'; Name = 'NVIDIA NVENC (GPU)';     Gpu = $true; Opts = '-preset p5 -tune hq -rc vbr' },
+    @{ Id = 'h264_qsv';   Name = 'Intel Quick Sync (GPU)'; Gpu = $true; Opts = '-preset slow' },
+    @{ Id = 'h264_amf';   Name = 'AMD AMF (GPU)';          Gpu = $true; Opts = '-quality quality -rc vbr_peak' }
 )
-$script:CpuEncoder = @{ Id = 'libx264'; Name = 'CPU (x264)'; Opts = '-preset medium' }
+$script:CpuEncoder = @{ Id = 'libx264';    Name = 'CPU (x264)'; Gpu = $false; Opts = '-preset medium' }
+$script:Vp9Encoder = @{ Id = 'libvpx-vp9'; Name = 'CPU (VP9)';  Gpu = $false; Opts = '-deadline good -cpu-used 4 -row-mt 1' }
+
+# Output formats. Kind picks the codec path: h264 = x264/GPU + AAC, vp9 = VP9 + Opus (WebM cannot hold H.264).
+$script:Formats = @(
+    @{ Name = 'MP4  - H.264 + AAC (most compatible)'; Ext = '.mp4';  Muxer = 'mp4';      Kind = 'h264'; Flags = '-movflags +faststart' },
+    @{ Name = 'MKV  - H.264 + AAC';                   Ext = '.mkv';  Muxer = 'matroska'; Kind = 'h264'; Flags = '' },
+    @{ Name = 'MOV  - H.264 + AAC (Apple / editors)'; Ext = '.mov';  Muxer = 'mov';      Kind = 'h264'; Flags = '-movflags +faststart' },
+    @{ Name = 'WebM - VP9 + Opus (CPU only, slower)'; Ext = '.webm'; Muxer = 'webm';     Kind = 'vp9';  Flags = '' }
+)
 
 # =====================================================================
 # 2. ERROR HANDLING + TOOL LOOKUP
 # =====================================================================
+[System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
+
 function Show-Msg([string]$text, [string]$title = 'Video Compressor', [string]$buttons = 'OK', [string]$icon = 'Information') {
     return [System.Windows.Forms.MessageBox]::Show($text, $title, $buttons, $icon)
 }
@@ -54,6 +66,13 @@ function Show-Fatal([string]$msg) {
     Write-ErrorLog $msg
     [void](Show-Msg ($msg + "`n`nDetails: " + $script:ErrLog) 'Video Compressor - Error' 'OK' 'Error')
 }
+
+# Safety net: an unexpected UI error gets a friendly dialog + log entry instead of the raw .NET crash box.
+[System.Windows.Forms.Application]::add_ThreadException({
+    param($sender, $e)
+    Write-ErrorLog $e.Exception.ToString()
+    [void](Show-Msg ("Unexpected error:`n" + $e.Exception.Message + "`n`nDetails: " + $script:ErrLog) 'Error' 'OK' 'Error')
+})
 
 function Find-Tool([string]$name) {
     if ($PSScriptRoot) {
@@ -96,6 +115,8 @@ function Get-BestEncoder {
 # =====================================================================
 $script:detected    = $script:CpuEncoder   # replaced after the window opens
 $script:enc         = $script:CpuEncoder
+$script:fmt         = $script:Formats[0]
+$script:busy        = $false
 $script:proc        = $null
 $script:pass        = 0
 $script:totalPasses = 2
@@ -105,6 +126,9 @@ $script:vkbps       = 0
 $script:akbps       = 128
 $script:inFile      = ''
 $script:outFile     = ''
+$script:durPath     = ''
+$script:durVal      = 0.0
+$script:InfoDefault = 'Duration: -   |   Est. video bitrate: -'
 $script:outTmp      = ''      # encode goes to <output>.part, renamed only on success
 $script:target      = 0
 $script:scale       = $false
@@ -114,11 +138,11 @@ $script:progFile    = Join-Path $script:workDir 'progress.txt'
 $script:errFile     = Join-Path $script:workDir 'ffmpeg_err.txt'
 
 # =====================================================================
-# 5. UI
+# 5. UI (controls only, behaviour is wired up in section 10)
 # =====================================================================
 $form = New-Object System.Windows.Forms.Form
 $form.Text            = "$($script:AppName) $($script:AppVer)"
-$form.Size            = New-Object System.Drawing.Size(620, 450)
+$form.Size            = New-Object System.Drawing.Size(620, 480)
 $form.StartPosition   = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox     = $false
@@ -126,6 +150,7 @@ $form.MaximizeBox     = $false
 function New-Label($text, $x, $y) {
     $l = New-Object System.Windows.Forms.Label
     $l.Text = $text; $l.Location = New-Object System.Drawing.Point($x, $y); $l.AutoSize = $true
+    $l.UseMnemonic = $false   # show '&' literally
     $form.Controls.Add($l)
     return $l
 }
@@ -138,7 +163,7 @@ $btnIn = New-Object System.Windows.Forms.Button
 $btnIn.Text = 'Browse...'; $btnIn.Location = '505,33'; $btnIn.Size = '85,27'
 $form.Controls.Add($btnIn)
 
-[void](New-Label 'Output file (.mp4):' 15 70)
+[void](New-Label 'Output file:' 15 70)
 $txtOut = New-Object System.Windows.Forms.TextBox
 $txtOut.Location = '15,90'; $txtOut.Size = '480,23'
 $form.Controls.Add($txtOut)
@@ -147,42 +172,55 @@ $btnOut.Text = 'Save as...'; $btnOut.Location = '505,88'; $btnOut.Size = '85,27'
 $form.Controls.Add($btnOut)
 
 [void](New-Label 'Target size (MB):' 15 130)
-$numMB = New-Object System.Windows.Forms.NumericUpDown
-$numMB.Location = '125,127'; $numMB.Size = '80,23'
-$numMB.Minimum = 1; $numMB.Maximum = 10000; $numMB.Value = $script:Cfg.DefaultMB
-$form.Controls.Add($numMB)
+$txtMB = New-Object System.Windows.Forms.TextBox
+$txtMB.Location = '125,127'; $txtMB.Size = '60,23'; $txtMB.MaxLength = 5   # starts empty on purpose
+$form.Controls.Add($txtMB)
+$btnMinus = New-Object System.Windows.Forms.Button
+$btnMinus.Text = '-'; $btnMinus.Location = '190,126'; $btnMinus.Size = '24,25'
+$form.Controls.Add($btnMinus)
+$btnPlus = New-Object System.Windows.Forms.Button
+$btnPlus.Text = '+'; $btnPlus.Location = '216,126'; $btnPlus.Size = '24,25'
+$form.Controls.Add($btnPlus)
+
+[void](New-Label 'Format:' 255 130)
+$cmbFmt = New-Object System.Windows.Forms.ComboBox
+$cmbFmt.DropDownStyle = 'DropDownList'
+$cmbFmt.Location = '308,127'; $cmbFmt.Size = '282,23'
+foreach ($f in $script:Formats) { [void]$cmbFmt.Items.Add($f.Name) }
+$cmbFmt.SelectedIndex = 0
+$form.Controls.Add($cmbFmt)
 
 $chkScale = New-Object System.Windows.Forms.CheckBox
 $chkScale.Text = 'Downscale to 720p (better quality at small sizes)'
-$chkScale.Location = '235,128'; $chkScale.AutoSize = $true
+$chkScale.Location = '15,160'; $chkScale.AutoSize = $true
 $form.Controls.Add($chkScale)
 
-$lblEnc = New-Label 'Encoder: detecting...' 15 160
+$lblEnc = New-Label 'Encoder: detecting...' 15 192
 $chkCpu = New-Object System.Windows.Forms.CheckBox
 $chkCpu.Text = 'Force CPU'
-$chkCpu.Location = '235,157'; $chkCpu.AutoSize = $true; $chkCpu.Enabled = $false
+$chkCpu.Location = '235,189'; $chkCpu.AutoSize = $true; $chkCpu.Enabled = $false
 $form.Controls.Add($chkCpu)
 
-$lblInfo = New-Label 'Duration: -   |   Est. video bitrate: -' 15 188
+$lblInfo = New-Label $script:InfoDefault 15 220
 
 $btnGo = New-Object System.Windows.Forms.Button
-$btnGo.Text = 'Compress'; $btnGo.Location = '15,215'; $btnGo.Size = '120,32'; $btnGo.Enabled = $false
+$btnGo.Text = 'Compress'; $btnGo.Location = '15,245'; $btnGo.Size = '120,32'; $btnGo.Enabled = $false
 $form.Controls.Add($btnGo)
 $btnCancel = New-Object System.Windows.Forms.Button
-$btnCancel.Text = 'Cancel'; $btnCancel.Location = '145,215'; $btnCancel.Size = '90,32'; $btnCancel.Enabled = $false
+$btnCancel.Text = 'Cancel'; $btnCancel.Location = '145,245'; $btnCancel.Size = '90,32'; $btnCancel.Enabled = $false
 $form.Controls.Add($btnCancel)
 
 $bar = New-Object System.Windows.Forms.ProgressBar
-$bar.Location = '15,260'; $bar.Size = '575,22'; $bar.Minimum = 0; $bar.Maximum = 100
+$bar.Location = '15,290'; $bar.Size = '575,22'; $bar.Minimum = 0; $bar.Maximum = 100
 $form.Controls.Add($bar)
 
 $log = New-Object System.Windows.Forms.TextBox
-$log.Location = '15,292'; $log.Size = '575,105'
+$log.Location = '15,322'; $log.Size = '575,105'
 $log.Multiline = $true; $log.ReadOnly = $true; $log.ScrollBars = 'Vertical'
 $form.Controls.Add($log)
 
 # =====================================================================
-# 6. HELPERS
+# 6. GENERAL HELPERS
 # =====================================================================
 function Write-Log([string]$msg) {
     $log.AppendText(("[{0}] {1}`r`n" -f (Get-Date -Format 'HH:mm:ss'), $msg))
@@ -206,17 +244,6 @@ function Get-Duration([string]$file) {
     return 0.0
 }
 
-function Set-Encoder($e) {
-    $script:enc         = $e
-    $script:totalPasses = if ($e.Id -eq 'libx264') { 2 } else { 1 }
-    $script:margin      = if ($e.Id -eq 'libx264') { $script:Cfg.MarginCpu } else { $script:Cfg.MarginGpu }
-}
-
-function Get-ChosenEncoder {
-    if ($chkCpu.Checked) { return $script:CpuEncoder }
-    return $script:detected
-}
-
 function Get-Bitrates([double]$duration, [int]$targetMB) {
     $totalKbps = ($targetMB * 1MB * 8 * $script:margin) / $duration / 1000
     $audio = if ($totalKbps -gt 400) { 128 } else { 64 }
@@ -224,20 +251,62 @@ function Get-Bitrates([double]$duration, [int]$targetMB) {
     return [pscustomobject]@{ Video = $video; Audio = $audio }
 }
 
+# =====================================================================
+# 7. UI STATE HELPERS (read and update the controls)
+# =====================================================================
+# Target size typed by the user: whole number 1..MaxMB, or 0 when empty/invalid.
+function Get-TargetMB {
+    $n = 0
+    if ([int]::TryParse($txtMB.Text.Trim(), [ref]$n) -and $n -ge 1 -and $n -le $script:Cfg.MaxMB) { return $n }
+    return 0
+}
+
+function Get-Format {
+    return $script:Formats[[math]::Max(0, $cmbFmt.SelectedIndex)]
+}
+
+# CPU encoders (x264, VP9) run 2 passes with a 5% margin. GPU encoders run 1 pass with an 8% margin.
+function Set-Encoder($e) {
+    $script:enc         = $e
+    $script:totalPasses = if ($e.Gpu) { 1 } else { 2 }
+    $script:margin      = if ($e.Gpu) { $script:Cfg.MarginGpu } else { $script:Cfg.MarginCpu }
+}
+
+function Get-ChosenEncoder {
+    if ((Get-Format).Kind -eq 'vp9') { return $script:Vp9Encoder }   # WebM = VP9, CPU only
+    if ($chkCpu.Checked) { return $script:CpuEncoder }
+    return $script:detected
+}
+
+# Refresh the encoder label and the Force CPU checkbox (not while an encode is running).
+function Update-EncoderUi {
+    $lblEnc.Text = 'Encoder: ' + (Get-ChosenEncoder).Name
+    if (-not $script:busy) {
+        $chkCpu.Enabled = ((Get-Format).Kind -ne 'vp9') -and [bool]$script:detected.Gpu
+    }
+}
+
 function Set-Busy([bool]$busy) {
+    $script:busy       = $busy
     $btnGo.Enabled     = -not $busy
     $btnCancel.Enabled = $busy
-    foreach ($c in @($txtIn, $txtOut, $btnIn, $btnOut, $numMB, $chkScale)) { $c.Enabled = -not $busy }
-    $chkCpu.Enabled = (-not $busy) -and ($script:detected.Id -ne 'libx264')
+    foreach ($c in @($txtIn, $txtOut, $btnIn, $btnOut, $txtMB, $btnMinus, $btnPlus, $cmbFmt, $chkScale)) { $c.Enabled = -not $busy }
+    if ($busy) { $chkCpu.Enabled = $false } else { Update-EncoderUi }
 }
 
 function Update-Info {
     $path = $txtIn.Text.Trim().Trim('"')
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return }
-    $d = Get-Duration $path
-    if ($d -le 0) { return }
+    if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        $lblInfo.Text = $script:InfoDefault
+        return
+    }
+    if ($script:durPath -ne $path) { $script:durVal = Get-Duration $path; $script:durPath = $path }   # cached: runs on every keystroke
+    $d = $script:durVal
+    if ($d -le 0) { $lblInfo.Text = $script:InfoDefault; return }
     Set-Encoder (Get-ChosenEncoder)
-    $br = Get-Bitrates $d ([int]$numMB.Value)
+    $mb = Get-TargetMB
+    if ($mb -le 0) { $lblInfo.Text = ("Duration: {0:N1}s   |   Enter a target size (MB)" -f $d); return }
+    $br = Get-Bitrates $d $mb
     $hint = ''
     if ($br.Video -lt $script:Cfg.MinVideoKbps)       { $hint = '  (target too small)' }
     elseif ($br.Video -lt $script:Cfg.LowQualityKbps) { $hint = '  (very low quality)' }
@@ -245,21 +314,24 @@ function Update-Info {
 }
 
 # =====================================================================
-# 7. ENCODE ENGINE
+# 8. ENCODE ENGINE (ffmpeg arguments, process control, progress)
 # =====================================================================
 function New-EncodeArguments([int]$pass) {
-    $v = $script:vkbps
+    $v   = $script:vkbps
+    $fmt = $script:fmt
 
     # Downscale never upscales (min 720, source height). Otherwise force even dimensions (yuv420p needs them).
     if ($script:scale) { $vf = '-vf "scale=-2:''min(720,ih)''"' }
     else               { $vf = '-vf "scale=trunc(iw/2)*2:trunc(ih/2)*2"' }
 
-    $base = "-y -hide_banner -nostats -loglevel error -progress `"$($script:progFile)`" -i `"$($script:inFile)`" $vf -pix_fmt yuv420p"
-    $out  = "-c:a aac -b:a $($script:akbps)k -movflags +faststart -f mp4 `"$($script:outTmp)`""
-    $opts = $script:enc.Opts
+    $acodec = if ($fmt.Kind -eq 'vp9') { 'libopus' } else { 'aac' }
+    $base   = "-y -hide_banner -nostats -loglevel error -progress `"$($script:progFile)`" -i `"$($script:inFile)`" $vf -pix_fmt yuv420p"
+    $out    = "-c:a $acodec -b:a $($script:akbps)k $($fmt.Flags) -f $($fmt.Muxer) `"$($script:outTmp)`""
+    $opts   = $script:enc.Opts
 
-    if ($script:enc.Id -eq 'libx264') {
-        $c = "-c:v libx264 $opts -b:v ${v}k -pass $pass -passlogfile `"$($script:logBase)`""
+    if (-not $script:enc.Gpu) {
+        # CPU: two-pass (x264 or VP9)
+        $c = "-c:v $($script:enc.Id) $opts -b:v ${v}k -pass $pass -passlogfile `"$($script:logBase)`""
         if ($pass -eq 1) { return "$base $c -an -f null NUL" }
         return "$base $c $out"
     }
@@ -312,6 +384,12 @@ function Get-ProgressSeconds {
     return 0.0
 }
 
+# =====================================================================
+# 9. RUN CONTROL (cleanup + the timer that drives the passes)
+# =====================================================================
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = $script:Cfg.TimerMs
+
 # Cleanup + log only. Callers show any dialogs afterwards.
 function Finish([bool]$ok, [string]$msg) {
     $timer.Stop()
@@ -323,11 +401,6 @@ function Finish([bool]$ok, [string]$msg) {
     $bar.Value = if ($ok) { 100 } else { 0 }
 }
 
-# =====================================================================
-# 8. TIMER (keeps the GUI responsive and drives the passes)
-# =====================================================================
-$timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = $script:Cfg.TimerMs
 $timer.Add_Tick({
     try {
         if (-not $script:proc) { return }
@@ -341,7 +414,7 @@ $timer.Add_Tick({
         $code = $script:proc.ExitCode
 
         if ($code -ne 0) {
-            if ($script:enc.Id -ne 'libx264') {
+            if ($script:enc.Gpu) {
                 # GPU encode failed (driver / unsupported input) -> automatic CPU fallback
                 Write-Log "$($script:enc.Name) failed (exit $code): $(Get-FfmpegError)"
                 Write-Log 'Falling back to CPU (x264).'
@@ -376,8 +449,9 @@ $timer.Add_Tick({
 })
 
 # =====================================================================
-# 9. EVENTS
+# 10. EVENTS
 # =====================================================================
+# ---- input / output files ----
 $btnIn.Add_Click({
     $dlg = New-Object System.Windows.Forms.OpenFileDialog
     $dlg.Filter = 'Video files|*.mp4;*.mkv;*.mov;*.avi;*.wmv;*.webm;*.flv;*.m4v|All files|*.*'
@@ -385,40 +459,66 @@ $btnIn.Add_Click({
 })
 $btnOut.Add_Click({
     $dlg = New-Object System.Windows.Forms.SaveFileDialog
-    $dlg.Filter = 'MP4 video|*.mp4'
-    if ($dlg.ShowDialog() -eq 'OK') { $txtOut.Text = $dlg.FileName }
+    $dlg.Filter      = 'MP4 video|*.mp4|MKV video|*.mkv|MOV video|*.mov|WebM video|*.webm'
+    $dlg.FilterIndex = $cmbFmt.SelectedIndex + 1
+    if ($dlg.ShowDialog() -eq 'OK') {
+        $txtOut.Text = $dlg.FileName
+        $cmbFmt.SelectedIndex = $dlg.FilterIndex - 1   # triggers the extension sync below
+    }
 })
 $txtIn.Add_DragEnter({ if ($_.Data.GetDataPresent('FileDrop')) { $_.Effect = 'Copy' } })
 $txtIn.Add_DragDrop({ $txtIn.Text = ($_.Data.GetData('FileDrop'))[0] })
 
 $txtIn.Add_TextChanged({
     $path = $txtIn.Text.Trim().Trim('"')
+    if ([string]::IsNullOrWhiteSpace($path)) { return }
     if (Test-Path -LiteralPath $path -PathType Leaf) {
         $dir  = Split-Path $path -Parent
         $name = [IO.Path]::GetFileNameWithoutExtension($path)
-        $txtOut.Text = Join-Path $dir "$name`_compressed.mp4"
+        $txtOut.Text = Join-Path $dir ($name + '_compressed' + (Get-Format).Ext)
         Update-Info
     }
 })
-$numMB.Add_ValueChanged({ Update-Info })
-$chkCpu.Add_CheckedChanged({
-    $lblEnc.Text = 'Encoder: ' + (Get-ChosenEncoder).Name
+
+# ---- target size, format and encoder options ----
+$txtMB.Add_KeyPress({
+    if (-not [char]::IsControl($_.KeyChar) -and -not [char]::IsDigit($_.KeyChar)) { $_.Handled = $true }
+})
+$txtMB.Add_TextChanged({
+    $clean = $txtMB.Text -replace '\D', ''          # also strips pasted non-digits
+    if ($clean -ne $txtMB.Text) { $txtMB.Text = $clean; $txtMB.SelectionStart = $txtMB.Text.Length }
+    Update-Info
+})
+$btnMinus.Add_Click({ $n = Get-TargetMB; if ($n -gt 1) { $txtMB.Text = [string]($n - 1) } })
+$btnPlus.Add_Click({  $n = Get-TargetMB; if ($n -lt $script:Cfg.MaxMB) { $txtMB.Text = [string]($n + 1) } })
+$chkCpu.Add_CheckedChanged({ Update-EncoderUi; Update-Info })
+$cmbFmt.Add_SelectedIndexChanged({
+    # keep the output file extension in sync with the chosen format
+    $o = $txtOut.Text.Trim().Trim('"')
+    if ($o) { $txtOut.Text = [IO.Path]::ChangeExtension($o, (Get-Format).Ext) }
+    Update-EncoderUi
     Update-Info
 })
 
+# ---- run / cancel ----
 $btnCancel.Add_Click({ Finish $false 'Cancelled.' })
 
 $btnGo.Add_Click({
     try {
         # ---- validate input ----
         $in = $txtIn.Text.Trim().Trim('"')
-        if (-not (Test-Path -LiteralPath $in -PathType Leaf)) { [void](Show-Msg 'Select a valid input video.' 'Error' 'OK' 'Warning'); return }
+        if ([string]::IsNullOrWhiteSpace($in) -or -not (Test-Path -LiteralPath $in -PathType Leaf)) { [void](Show-Msg 'Select a valid input video.' 'Error' 'OK' 'Warning'); return }
         $inFull = [IO.Path]::GetFullPath($in)
+
+        # ---- validate target size (box starts empty) ----
+        $mb = Get-TargetMB
+        if ($mb -le 0) { [void](Show-Msg "Enter a target size in MB (1 to $($script:Cfg.MaxMB))." 'Target size needed' 'OK' 'Warning'); $txtMB.Focus(); return }
 
         # ---- validate output ----
         $out = $txtOut.Text.Trim().Trim('"')
         if ([string]::IsNullOrWhiteSpace($out)) { [void](Show-Msg 'Choose an output file.' 'Error' 'OK' 'Warning'); return }
-        if ([IO.Path]::GetExtension($out) -ine '.mp4') { $out = [IO.Path]::ChangeExtension($out, '.mp4') }
+        $fmt = Get-Format
+        if ([IO.Path]::GetExtension($out) -ine $fmt.Ext) { $out = [IO.Path]::ChangeExtension($out, $fmt.Ext) }
         $txtOut.Text = $out
         $outFull = [IO.Path]::GetFullPath($out)
         if ($outFull -ieq $inFull) { [void](Show-Msg 'Output must be a different file than the input.' 'Error' 'OK' 'Warning'); return }
@@ -429,10 +529,11 @@ $btnGo.Add_Click({
         }
 
         # ---- analyse ----
+        $script:fmt      = $fmt
         $script:inFile   = $inFull
         $script:outFile  = $outFull
         $script:outTmp   = $outFull + '.part'
-        $script:target   = [int]$numMB.Value
+        $script:target   = $mb
         $script:scale    = $chkScale.Checked
         $script:duration = Get-Duration $inFull
         if ($script:duration -le 0) { [void](Show-Msg 'Could not read the video duration. Is the file a valid video?' 'Error' 'OK' 'Warning'); return }
@@ -456,7 +557,7 @@ $btnGo.Add_Click({
         # ---- go ----
         New-Item -ItemType Directory -Path $script:workDir -Force | Out-Null
         $log.Clear(); $bar.Value = 0
-        Write-Log ("Target {0} MB | video {1} kbps | audio {2} kbps" -f $script:target, $script:vkbps, $script:akbps)
+        Write-Log ("Format {0} | target {1} MB | video {2} kbps | audio {3} kbps" -f $fmt.Ext, $script:target, $script:vkbps, $script:akbps)
         Set-Busy $true
         Start-Pass 1
         $timer.Start()
@@ -467,6 +568,7 @@ $btnGo.Add_Click({
     }
 })
 
+# ---- window lifecycle ----
 $form.Add_FormClosing({
     $timer.Stop()
     Stop-Encode
@@ -480,15 +582,14 @@ $form.Add_Shown({
     $form.Refresh()
     [System.Windows.Forms.Application]::DoEvents()
     try { $script:detected = Get-BestEncoder } catch { $script:detected = $script:CpuEncoder }
-    Set-Encoder $script:detected
-    $lblEnc.Text    = 'Encoder: ' + $script:detected.Name
-    $chkCpu.Enabled = ($script:detected.Id -ne 'libx264')
+    Set-Encoder (Get-ChosenEncoder)
+    Update-EncoderUi
     $btnGo.Enabled  = $true
     Write-Log "Detected encoder: $($script:detected.Name)"
 })
 
 # =====================================================================
-# 10. START
+# 11. START
 # =====================================================================
 try {
     [void]$form.ShowDialog()

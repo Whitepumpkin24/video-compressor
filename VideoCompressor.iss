@@ -5,7 +5,7 @@
 [Setup]
 AppId={{8F3A6B1E-2C4D-4E7A-9B15-6D0C7A3F2E91}
 AppName=Video Compressor
-AppVersion=1.1
+AppVersion=1.2.2
 AppPublisher=Whitepumpkin
 DefaultDirName={autopf}\Video Compressor
 DefaultGroupName=Video Compressor
